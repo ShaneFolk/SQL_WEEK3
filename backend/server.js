@@ -444,65 +444,119 @@ app.post("/orders", authenticateToken, async (req, res) => {
     });
 });
 
+// ------------------------------------------------------------
+// POST /orders  — place an order (transaction) — end
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// GET /orders/my  — the logged-in user's own orders — start
+// ------------------------------------------------------------
+
+// Returns only the orders that belong to whoever is logged in.
+// authenticateToken runs first: requires a valid JWT, and sets req.user.
+// NOTE: this is declared BEFORE /orders/:id on purpose. Otherwise Express
+// would treat "my" as an :id and send it to the wrong route. Keep this order.
 app.get("/orders/my", authenticateToken, (req, res) => {
+    // Newest orders first (ORDER BY created_at DESC)
     const sql = `SELECT id, status, total_amount, created_at
-                 FROM orders 
+                 FROM orders
                  WHERE user_id = ?
                  ORDER BY created_at DESC`;
+    // The user id comes from the token, not the URL or body, so users
+    // can't ask for someone else's orders.
     const params = [req.user.id];
     db.query(sql, params, (err, results) => {
+        // 500 = database/server error (error details are left out of the response)
         if (err) {
             return res.status(500).json({ message: "server error" });
         }
+        // 200 = OK. An empty array just means this user has no orders yet.
         res.status(200).json(results);
     });
 });
 
+// ------------------------------------------------------------
+// GET /orders/my  — the logged-in user's own orders — end
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// GET /orders/:id  — one order with its line items — start
+// ------------------------------------------------------------
+
+// Returns a single order joined to its items and each item's product name.
+// authenticateToken runs first: requires a valid JWT.
 app.get("/orders/:id", authenticateToken, (req, res) => {
+    // :id is the URL parameter, e.g. /orders/7 -> id = "7"
     const { id } = req.params;
+    // Two JOINs: orders -> order_items (the lines in the order),
+    // then order_items -> products (to get each product's name).
+    // The AS aliases rename columns so the two "id" columns don't clash.
+    // This returns ONE ROW PER ITEM in the order.
     const sql = `SELECT o.id AS order_id, o.status, o.total_amount, o.created_at, oi.id AS item_id, oi.quantity, oi.price_at_purchase, oi.subtotal, p.name AS product_name
                  FROM orders o
                  JOIN order_items oi ON o.id = oi.order_id
                  JOIN products p ON oi.product_id = p.id
-                 WHERE o.id = ? 
+                 WHERE o.id = ?
                  ORDER BY oi.id ASC`;
     db.query(sql, [id], (err, results) => {
+        // 500 = database/server error
         if (err) {
             return res.status(500).json({ message: "server error" });
         }
+        // No rows -> no order with that id (or it has no items) -> 404 Not Found
         if (results.length === 0) {
             return res.status(404).json({ message: "order not found" });
         }
+        // 200 = OK. results[0] sends only the FIRST row, i.e. the order
+        // details plus its first item.
         res.status(200).json(results[0]);
     });
 });
 
 // ------------------------------------------------------------
-// POST /orders  — place an order (transaction) — end
+// GET /orders/:id  — one order with its line items — end
 // ------------------------------------------------------------
 
+// ------------------------------------------------------------
+// GET /orders  — list orders (all for admin, own for customers) — start
+// ------------------------------------------------------------
+
+// One route, two behaviours depending on the user's role:
+//   admin    -> every order, plus the customer's name and email
+//   anyone else -> only their own orders
+// authenticateToken runs first: requires a valid JWT, and sets req.user.
 app.get("/orders", authenticateToken, (req, res) => {
+    // Declared with let (no value yet) because the if/else below fills them in
     let sql;
     let params;
 
+    // req.user.role comes from the JWT payload created at login
     if (req.user.role === "admin") {
-        sql = `SELECT o.id, o.status, o.total_amount, o.created_at, u.first_name, u.last_name, u.email 
+        // JOIN users so the admin can see who placed each order
+        sql = `SELECT o.id, o.status, o.total_amount, o.created_at, u.first_name, u.last_name, u.email
                FROM orders o
                JOIN users u ON o.user_id = u.id`;
-        params = [];
+        params = []; // no ? placeholders in this query, so no values
     } else {
+        // Regular users: filter to their own user id from the token
         sql = `SELECT o.id, o.status, o.total_amount, o.created_at
                FROM orders o
                WHERE o.user_id = ?`;
         params = [req.user.id];
     }
     db.query(sql, params, (err, results) => {
+        // 500 = database/server error
         if (err) {
             return res.status(500).json({ message: "server error", error: err });
         }
+        // 200 = OK. Send the array of order rows back as JSON.
         res.status(200).json(results);
     });
 });
+
+// ------------------------------------------------------------
+// GET /orders  — list orders (all for admin, own for customers) — end
+// ------------------------------------------------------------
 
 // ------------------------------------------------------------
 // GET /categories  — list categories with product counts — start
@@ -576,6 +630,171 @@ app.post("/reviews", authenticateToken, async (req, res) => {
 
 // ------------------------------------------------------------
 // POST /reviews  — add a review for a product — end
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// GET /reports/sales  — sales summary report (admin only) — start
+// ------------------------------------------------------------
+
+// Returns overall sales stats across every order.
+// Two middleware run first, in order:
+//   authenticateToken      -> must be logged in (valid JWT)
+//   authorizeRole('admin') -> must have the admin role
+app.get('/reports/sales', authenticateToken, authorizeRole('admin'),  (req,res) => {
+    // Aggregate functions squash all the order rows into ONE summary row:
+    //   COUNT(*) -> how many orders     SUM -> total revenue
+    //   AVG      -> average order value  MAX/MIN -> biggest/smallest order
+    // (MySQL column names aren't case-sensitive, so Total_amount still works.)
+    const sql = `SELECT COUNT(*) AS total_orders,
+                        SUM(total_amount) AS total_revenue,
+                        AVG(total_amount) AS average_order_value,
+                        MAX(Total_amount) AS highest_order,
+                        MIN(total_amount) AS lowest_order
+                 FROM orders`;
+
+    db.query(sql, (err, results) => {
+        // 500 = database/server error. Full detail goes to the server log only.
+        if(err) {
+            console.error(err);
+            return res.status(500).json({message: "server error"});
+        }
+        // Aggregates return a single row, so send results[0] (an object, not an array)
+        res.json(results[0]);
+    });
+});
+
+// ------------------------------------------------------------
+// GET /reports/sales  — sales summary report (admin only) — end
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// GET /reports/top-products  — top 10 best-selling products (admin only) — start
+// ------------------------------------------------------------
+
+// Returns the 10 products that have sold the most units, with revenue for each.
+// Two middleware run first, in order:
+//   authenticateToken      -> must be logged in (valid JWT)
+//   authorizeRole('admin') -> must have the admin role
+app.get('/reports/top-products', authenticateToken, authorizeRole('admin'), (req,res) => {
+    // INNER JOIN order_items -> products so each sold line has a product name.
+    // GROUP BY p.id, p.name -> one row per product, so SUM adds up all of
+    //   that product's order lines (units sold and money made).
+    // ORDER BY total_sold DESC -> best sellers first; LIMIT 10 -> keep the top 10.
+    const sql = `SELECT p.id, p.name AS products_name,
+                        SUM(oi.quantity) AS total_sold,
+                        SUM(oi.subtotal) AS total_revenue
+                 FROM order_items oi
+                 INNER JOIN products p ON p.id = oi.product_id
+                 GROUP BY p.id, p.name
+                 ORDER by total_sold DESC
+                 LIMIT 10`;
+
+    // No ? placeholders in this query, so no values array is passed
+    db.query(sql, (err, results) => {
+        // 500 = database/server error
+        if(err){
+            console.error(err);
+            return res.status(500).json({message: "server error"});
+        }
+        // 200 = OK. Send the array of (up to 10) product rows back as JSON.
+        res.json(results);
+    });
+});
+
+// ------------------------------------------------------------
+// GET /reports/top-products  — top 10 best-selling products (admin only) — end
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// GET /reports/category-sales  — sales totals per category (admin only) — start
+// ------------------------------------------------------------
+
+// Returns each category's number of items sold, revenue, and average item value.
+// Two middleware run first, in order:
+//   authenticateToken      -> must be logged in (valid JWT)
+//   authorizeRole('admin') -> must have the admin role
+app.get('/reports/category-sales', authenticateToken, authorizeRole('admin'), (req,res) => {
+    // Joins: order_items -> products (which product was sold)
+    //        products -> categories (which category that product is in).
+    // RIGHT JOIN keeps every category, even ones with no sales (their sums are NULL).
+    // COUNT(oi.id) counts order LINES (items sold), not separate orders.
+    // ROUND(AVG(...), 2) -> average line subtotal rounded to 2 decimals (cents).
+    // GROUP BY c.id, c.name -> one summary row per category.
+    // HAVING filters AFTER grouping (WHERE can't use SUM). It keeps only categories
+    //   with sales, so the no-sales categories the RIGHT JOIN kept get removed here.
+    // ORDER BY total_revenue DESC -> highest-earning category first.
+    const sql = `SELECT c.id,
+                        c.name AS category_name,
+                        COUNT(oi.id) AS total_orders,
+                        SUM(oi.subtotal) AS total_revenue,
+                        ROUND(AVG(oi.subtotal),2) AS average_item_value
+                 FROM order_items oi
+                 INNER JOIN products p ON p.id = oi.product_id
+                 RIGHT JOIN categories c ON c.id = p.category_id
+                 GROUP BY c.id, c.name
+                 HAVING SUM(oi.subtotal) > 0
+                 ORDER BY total_revenue DESC`;
+
+    // No ? placeholders in this query, so no values array is passed
+    db.query(sql, (err, results) => {
+        // 500 = database/server error. Full detail goes to the server log only.
+        if(err){
+            console.error(err);
+            return res.status(500).json({message: "Server error"});
+        }
+        // 200 = OK. Send the array of category rows back as JSON.
+        res.json(results);
+    });
+});
+
+// ------------------------------------------------------------
+// GET /reports/category-sales  — sales totals per category (admin only) — end
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// GET /inventory  — stock levels with a status label (admin only) — start
+// ------------------------------------------------------------
+
+// Returns every product's stock count, category, and a stock status label.
+// Two middleware run first, in order:
+//   authenticateToken      -> must be logged in (valid JWT)
+//   authorizeRole('admin') -> must have the admin role
+app.get('/inventory', authenticateToken, authorizeRole('admin'), (req,res) => {
+    // CASE works like an if / else if / else inside SQL. It's checked top-down
+    // and the first true WHEN wins:
+    //   more than 10      -> 'in_stock'
+    //   1 to 10           -> 'low_stock'
+    //   0 (or less)       -> 'out_of_stock'
+    // END AS stock_status names the new column the CASE creates.
+    // INNER JOIN categories -> adds each product's category name.
+    // ORDER BY stock_quantity ASC -> lowest stock first, so problems show at the top.
+    const sql = `SELECT p.id,
+                        p.name,
+                        p.stock_quantity,
+                        c.name AS category_name,
+                        CASE
+                            WHEN p.stock_quantity > 10 THEN 'in_stock'
+                            WHEN p.stock_quantity > 0 THEN 'low_stock'
+                            ELSE 'out_of_stock'
+                        END AS stock_status
+                 FROM products p
+                 INNER JOIN categories c ON c.id = p.category_id
+                 ORDER BY p.stock_quantity ASC;`;
+
+    // No ? placeholders in this query, so no values array is passed
+    db.query(sql, (err, results) => {
+        // 500 = database/server error. Full detail goes to the server log only.
+        if(err){
+            console.error(err);
+            return res.status(500).json({message:"Server error"});
+        }
+        // 200 = OK. Send the array of product stock rows back as JSON.
+        res.json(results);
+    });
+});
+
+// ------------------------------------------------------------
+// GET /inventory  — stock levels with a status label (admin only) — end
 // ------------------------------------------------------------
 
 // ============================================================
